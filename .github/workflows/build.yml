@@ -1,0 +1,334 @@
+# Build only. This workflow is NOT a no-serial partition migration installer.
+# Replace .github/workflows/build.yml in your own repository with this file.
+# Standalone: no files other than this workflow are needed in your repository.
+# OpenWrt 25.12 uses APK. No flashing or automatic volume-resize commands are run.
+name: WRC-X3200GST3 25.12.6 109MiB - build only
+
+"on":
+  workflow_dispatch:
+    inputs:
+      include_python:
+        description: 'Include Python 3 and pip (larger final image; NOT a transition image)'
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_TAG: v25.12.6
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout the fixed upstream OpenWrt tag
+        uses: actions/checkout@v6
+        with:
+          repository: openwrt/openwrt
+          ref: ${{ env.OPENWRT_TAG }}
+          path: openwrt
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare space on the disposable build runner
+        run: |
+          set -euo pipefail
+          # These are preinstalled SDKs on the ephemeral runner, not router data.
+          for sdk in /usr/local/lib/android /usr/share/dotnet /opt/ghc; do
+            if [ -d "$sdk" ]; then
+              sudo rm -rf -- "$sdk"
+            fi
+          done
+          df -h .
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            libelf-dev python3 python3-setuptools rsync swig unzip zlib1g-dev \
+            file wget curl cpio xz-utils zstd bzip2 ca-certificates
+          df -h .
+
+      - name: Apply guarded 109 MiB layout changes
+        run: |
+          set -euo pipefail
+          cd openwrt
+          test "$(git describe --tags --exact-match HEAD)" = "$OPENWRT_TAG"
+          python3 - <<'PY_PATCH'
+          from pathlib import Path
+          import re
+
+
+          def replace_one(pattern, replacement, text, what):
+              result, count = re.subn(pattern, replacement, text, flags=re.M)
+              if count != 1:
+                  raise SystemExit(f"Refusing to continue: {what}: expected 1 match, got {count}")
+              return result
+
+
+          dts = Path('target/linux/mediatek/dts/mt7622-elecom-wrc-x3200gst3.dts')
+          mk = Path('target/linux/mediatek/image/mt7622.mk')
+          s = dts.read_text()
+          # Refuse an unknown layout instead of silently guessing.
+          if 'reg = <0x2c0000 0x600000>;' not in s:
+              raise SystemExit('Unexpected kernel layout')
+          s = replace_one(r'reg = <0x8c0000 0x1300000>;',
+                          'reg = <0x8c0000 0x6d00000>;', s, 'UBI size')
+          for address, label, size in [
+              ('1bc0000', 'tm_pattern', '500000'),
+              ('20c0000', 'tm_key', '100000'),
+              ('21c0000', 'user_data', 'f00000'),
+              ('30c0000', 'reserved', '4f40000'),
+          ]:
+              pattern = (r'^[ \t]*partition@' + address +
+                         r'\s*\{[^{}]*\};[ \t]*\n?')
+              matches = list(re.finditer(pattern, s, re.M))
+              if len(matches) != 1:
+                  raise SystemExit('Unexpected partition: ' + label)
+              block = matches[0].group()
+              if (f'label = "{label}";' not in block or
+                      f'reg = <0x{address} 0x{size}>;' not in block or
+                      'read-only;' not in block):
+                  raise SystemExit('Unexpected partition definition: ' + label)
+              s = re.sub(pattern, '', s, count=1, flags=re.M)
+          s = replace_one(
+              r'mediatek,bmt-remap-range\s*=\s*<0x0 0x8c0000>,\s*<0x1bc0000 0x30c0000>;',
+              'mediatek,bmt-remap-range = <0x0 0x8c0000>;', s, 'BMT range')
+          if len(re.findall(r'\bpartition@[0-9a-f]+\s*\{', s)) != 7:
+              raise SystemExit('Unexpected number of MTD partition definitions')
+
+          m = mk.read_text()
+          pattern = r'^define Device/elecom_wrc-x3200gst3\n.*?^endef$'
+          blocks = list(re.finditer(pattern, m, re.M | re.S))
+          if len(blocks) != 1:
+              raise SystemExit('Unexpected image definition')
+          old = blocks[0].group()
+          if not re.search(r'^\s*KERNEL_SIZE := 6144k$', old, re.M):
+              raise SystemExit('Kernel size must remain 6144k')
+          new = replace_one(r'IMAGE_SIZE := 25600k', 'IMAGE_SIZE := 117760k',
+                            old, 'image size')
+          m = m[:blocks[0].start()] + new + m[blocks[0].end():]
+          # Write only after all checks passed.
+          dts.write_text(s)
+          mk.write_text(m)
+          print('UBI: 109 MiB; kernel: 6 MiB; end: 0x075c0000')
+          print('No bootloader, environment or factory/calibration definitions changed.')
+          PY_PATCH
+          git diff --check
+          git diff -- target/linux/mediatek/dts/mt7622-elecom-wrc-x3200gst3.dts \
+            target/linux/mediatek/image/mt7622.mk | tee ../layout.patch
+
+      - name: Install pinned release feeds and configure
+        env:
+          WITH_PYTHON: ${{ inputs.include_python }}
+        run: |
+          set -euo pipefail
+          cd openwrt
+          # v25.12.6 feeds.conf.default already pins each feed to a commit.
+          ./scripts/feeds update -a 2>&1 | tee ../feeds-update.log
+          ./scripts/feeds install -a 2>&1 | tee ../feeds-install.log
+          cat > .config <<'CONFIG'
+          CONFIG_TARGET_mediatek=y
+          CONFIG_TARGET_mediatek_mt7622=y
+          CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3=y
+          CONFIG_TARGET_ROOTFS_INITRAMFS=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          # CONFIG_TARGET_ROOTFS_EROFS is not set
+          CONFIG_USE_APK=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-app-package-manager=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_ubi-utils=y
+          CONFIG_PACKAGE_uboot-envtools=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG
+          if [ "$WITH_PYTHON" = true ]; then
+            printf '\nCONFIG_PACKAGE_python3=y\nCONFIG_PACKAGE_python3-pip=y\n' >> .config
+          fi
+          make defconfig 2>&1 | tee ../defconfig.log
+          for symbol in \
+            CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3 \
+            CONFIG_TARGET_ROOTFS_INITRAMFS CONFIG_TARGET_ROOTFS_SQUASHFS \
+            CONFIG_USE_APK CONFIG_PACKAGE_luci CONFIG_PACKAGE_ubi-utils \
+            CONFIG_PACKAGE_luci-app-package-manager CONFIG_PACKAGE_luci-i18n-base-zh-cn; do
+            grep -qx "${symbol}=y" .config
+          done
+          if [ "$WITH_PYTHON" = true ]; then
+            grep -qx 'CONFIG_PACKAGE_python3=y' .config
+            grep -qx 'CONFIG_PACKAGE_python3-pip=y' .config
+          fi
+
+      - name: Download build sources
+        run: |
+          set -euo pipefail
+          cd openwrt
+          make download -j4 2>&1 | tee ../download.log
+
+      - name: Compile (retry serially for a useful error log)
+        run: |
+          set -euo pipefail
+          cd openwrt
+          (make -j2 || make -j1 V=s) 2>&1 | tee ../build.log
+
+      - name: Check both images and their embedded device trees
+        run: |
+          set -euo pipefail
+          cd openwrt
+          python3 - <<'PY_VERIFY'
+          from pathlib import Path
+          import struct
+          import tarfile
+          import shutil
+
+
+          def parse_fdt(data):
+              if len(data) < 40:
+                  raise ValueError('Truncated FDT header')
+              magic, total, off_struct, off_strings, _, _, _, _, str_size, struct_size = \
+                  struct.unpack_from('>10I', data)
+              if magic != 0xd00dfeed or total > len(data):
+                  raise ValueError('Invalid FDT/FIT header')
+              if off_struct + struct_size > total or off_strings + str_size > total:
+                  raise ValueError('Invalid FDT bounds')
+              strings = data[off_strings:off_strings + str_size]
+              pos, end = off_struct, off_struct + struct_size
+              stack, props = [], {}
+              while pos + 4 <= end:
+                  token = struct.unpack_from('>I', data, pos)[0]
+                  pos += 4
+                  if token == 1:
+                      stop = data.index(b'\0', pos, end)
+                      stack.append(data[pos:stop].decode('ascii'))
+                      pos = (stop + 4) & ~3
+                  elif token == 2:
+                      if not stack:
+                          raise ValueError('Invalid FDT nesting')
+                      stack.pop()
+                  elif token == 3:
+                      length, name_off = struct.unpack_from('>II', data, pos)
+                      pos += 8
+                      if pos + length > end or name_off >= len(strings):
+                          raise ValueError('Invalid FDT property')
+                      name_end = strings.index(b'\0', name_off)
+                      name = strings[name_off:name_end].decode('ascii')
+                      path = '/' + '/'.join(part for part in stack if part)
+                      props[(path, name)] = data[pos:pos + length]
+                      pos = (pos + length + 3) & ~3
+                  elif token == 4:
+                      continue
+                  elif token == 9:
+                      return props
+                  else:
+                      raise ValueError(f'Unexpected FDT token: {token}')
+              raise ValueError('No FDT end token')
+
+
+          def check_fit(blob, title):
+              fit = parse_fdt(blob)
+              cfg = fit[('/configurations', 'default')].rstrip(b'\0').decode()
+              fdt_name = fit[(f'/configurations/{cfg}', 'fdt')].rstrip(b'\0').decode()
+              # The upstream MT7622 mkits image embeds its DTB in a data property.
+              dtb = fit[(f'/images/{fdt_name}', 'data')]
+              props = parse_fdt(dtb)
+              expected = {
+                  'Preloader': (0x0, 0x80000),
+                  'ATF': (0x80000, 0x40000),
+                  'u-boot': (0xc0000, 0x80000),
+                  'u-boot-env': (0x140000, 0x80000),
+                  'factory': (0x1c0000, 0x100000),
+                  'kernel': (0x2c0000, 0x600000),
+                  'ubi': (0x8c0000, 0x6d00000),
+              }
+              actual = {}
+              for (path, name), value in props.items():
+                  if name == 'label' and '/partitions/partition@' in path:
+                      label = value.rstrip(b'\0').decode()
+                      actual[label] = struct.unpack('>II', props[(path, 'reg')])
+              if actual != expected:
+                  raise SystemExit(f'{title}: unexpected MTD layout: {actual}')
+              bmt = [v for (p, n), v in props.items() if n == 'mediatek,bmt-remap-range']
+              if bmt != [struct.pack('>II', 0, 0x8c0000)]:
+                  raise SystemExit(f'{title}: unexpected BMT mapping')
+              print(f'{title}: embedded DTB has the expected 109 MiB layout')
+
+
+          directory = Path('bin/targets/mediatek/mt7622')
+          sysup = list(directory.glob('*elecom_wrc-x3200gst3-squashfs-sysupgrade.bin'))
+          ram = list(directory.glob('*elecom_wrc-x3200gst3-initramfs-kernel.bin'))
+          if len(sysup) != 1 or len(ram) != 1:
+              raise SystemExit('Expected exactly one sysupgrade and one initramfs image')
+          with tarfile.open(sysup[0], 'r:') as archive:
+              kernels = [m for m in archive if m.isfile() and m.name.endswith('/kernel')]
+              roots = [m for m in archive if m.isfile() and m.name.endswith('/root')]
+              if len(kernels) != 1 or len(roots) != 1:
+                  raise SystemExit('Unexpected sysupgrade archive layout')
+              if not 0 < kernels[0].size <= 6 * 1024 * 1024:
+                  raise SystemExit('Kernel is empty or exceeds 6 MiB')
+              if not 0 < roots[0].size < 109 * 1024 * 1024:
+                  raise SystemExit('Rootfs size is implausible for this layout')
+              if archive.extractfile(roots[0]).read(4) != b'hsqs':
+                  raise SystemExit('Expected a SquashFS root filesystem')
+              check_fit(archive.extractfile(kernels[0]).read(), 'sysupgrade kernel')
+              print('Kernel bytes:', kernels[0].size, 'Rootfs bytes:', roots[0].size)
+          check_fit(ram[0].read_bytes(), 'initramfs')
+          output = Path('../artifacts')
+          output.mkdir(exist_ok=True)
+          for image in sysup + ram:
+              shutil.copy2(image, output / image.name)
+          for path in directory.glob('*elecom_wrc-x3200gst3*.manifest'):
+              shutil.copy2(path, output / path.name)
+          shutil.copy2('.config', output / 'full.config')
+          shutil.copy2('feeds.conf.default', output / 'feeds.conf.default')
+          print('Checks do not prove bootability or safe migration from the 19 MiB layout.')
+          PY_VERIFY
+          ./scripts/diffconfig.sh > ../artifacts/build.config
+          git rev-parse HEAD > ../artifacts/source-commit.txt
+          cp ../layout.patch ../artifacts/layout.patch
+          for feed in feeds/*; do
+            if [ -d "$feed/.git" ] || [ -f "$feed/.git" ]; then
+              printf '%s ' "${feed##*/}"
+              git -C "$feed" rev-parse HEAD
+            fi
+          done > ../artifacts/feed-commits.txt
+          printf '%s\n' \
+            'BUILD OUTPUT ONLY. NOT A VALIDATED NO-SERIAL MIGRATION INSTALLER.' \
+            'Do not directly force-flash this onto the current 19 MiB UBI layout.' \
+            'initramfs is for RAM boot, never for writing to the 6 MiB kernel partition.' \
+            'No automatic rootfs_data resize service is included.' \
+            'Back up all affected MTD partitions before any migration.' \
+            'Future firmware must retain the same partition layout.' \
+            > ../artifacts/READ-BEFORE-FLASH.txt
+          cd ../artifacts
+          sha256sum *.bin > SHA256SUMS
+          ls -lh
+
+      - name: Upload checked firmware artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: wrc-x3200gst3-25.12.6-109MiB-python-${{ inputs.include_python }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload logs even after a failed build
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: wrc-x3200gst3-25.12.6-build-logs
+          path: |
+            feeds-update.log
+            feeds-install.log
+            defconfig.log
+            download.log
+            build.log
+            layout.patch
+          if-no-files-found: warn
+          retention-days: 30
