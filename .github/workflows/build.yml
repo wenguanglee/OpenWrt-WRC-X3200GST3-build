@@ -125,16 +125,33 @@ jobs:
           git diff --check
           git diff -- target/linux/mediatek/dts/mt7622-elecom-wrc-x3200gst3.dts \
             target/linux/mediatek/image/mt7622.mk | tee ../layout.patch
-
+            
       - name: Install pinned release feeds and configure
         env:
           WITH_PYTHON: ${{ inputs.include_python }}
         run: |
           set -euo pipefail
           cd openwrt
-          # v25.12.6 feeds.conf.default already pins each feed to a commit.
+
           ./scripts/feeds update -a 2>&1 | tee ../feeds-update.log
           ./scripts/feeds install -a 2>&1 | tee ../feeds-install.log
+
+          # Exclude the unused recipe that causes the Kconfig dependency cycle.
+          ./scripts/feeds uninstall luci-app-weechat 2>&1 | tee ../feeds-exclude.log
+
+          if [ -e package/feeds/luci/luci-app-weechat ] || [ -L package/feeds/luci/luci-app-weechat ]; then
+            echo "::error::Failed to exclude luci-app-weechat"
+            exit 1
+          fi
+
+          # Regenerate package metadata.
+          rm -f tmp/.packageinfo tmp/.config-package.in
+
+          printf '%s\n' \
+            'Excluded unused feed recipe: luci-app-weechat.' \
+            'Enabled CONFIG_LUCI_LANG_zh_Hans=y.' \
+            > ../build-workarounds.txt
+
           cat > .config <<'CONFIG'
           CONFIG_TARGET_mediatek=y
           CONFIG_TARGET_mediatek_mt7622=y
@@ -145,26 +162,65 @@ jobs:
           CONFIG_USE_APK=y
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-app-package-manager=y
+          CONFIG_LUCI_LANG_zh_Hans=y
           CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
           CONFIG_PACKAGE_ubi-utils=y
           CONFIG_PACKAGE_uboot-envtools=y
           CONFIG_PACKAGE_ca-bundle=y
           CONFIG
+
           if [ "$WITH_PYTHON" = true ]; then
             printf '\nCONFIG_PACKAGE_python3=y\nCONFIG_PACKAGE_python3-pip=y\n' >> .config
           fi
-          make defconfig 2>&1 | tee ../defconfig.log
-          for symbol in \
-            CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3 \
-            CONFIG_TARGET_ROOTFS_INITRAMFS CONFIG_TARGET_ROOTFS_SQUASHFS \
-            CONFIG_USE_APK CONFIG_PACKAGE_luci CONFIG_PACKAGE_ubi-utils \
-            CONFIG_PACKAGE_luci-app-package-manager CONFIG_PACKAGE_luci-i18n-base-zh-cn; do
-            grep -qx "${symbol}=y" .config
-          done
-          if [ "$WITH_PYTHON" = true ]; then
-            grep -qx 'CONFIG_PACKAGE_python3=y' .config
-            grep -qx 'CONFIG_PACKAGE_python3-pip=y' .config
+
+          cp .config ../config-before-defconfig.txt
+
+          if make defconfig RECURSIVE_DEP_IS_ERROR=1 2>&1 | tee ../defconfig.log; then
+            cp .config ../config-after-defconfig.txt
+          else
+            cp .config ../config-after-defconfig.txt
+            echo "::error::make defconfig failed. See defconfig.log."
+            exit 1
           fi
+
+          {
+            failures=0
+
+            check_symbol() {
+              local symbol="$1"
+              if grep -qx "${symbol}=y" .config; then
+                echo "OK: ${symbol}=y"
+              else
+                echo "::error::Required option did not become y: ${symbol}"
+                grep -n -F -- "$symbol" .config || true
+                failures=$((failures + 1))
+              fi
+            }
+
+            for symbol in \
+              CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3 \
+              CONFIG_TARGET_ROOTFS_INITRAMFS CONFIG_TARGET_ROOTFS_SQUASHFS \
+              CONFIG_USE_APK CONFIG_PACKAGE_luci CONFIG_PACKAGE_ubi-utils \
+              CONFIG_PACKAGE_uboot-envtools CONFIG_PACKAGE_ca-bundle \
+              CONFIG_PACKAGE_luci-app-package-manager CONFIG_LUCI_LANG_zh_Hans \
+              CONFIG_PACKAGE_luci-i18n-base-zh-cn; do
+              check_symbol "$symbol"
+            done
+
+            if [ "$WITH_PYTHON" = true ]; then
+              check_symbol CONFIG_PACKAGE_python3
+              check_symbol CONFIG_PACKAGE_python3-pip
+            fi
+
+            if [ "$failures" -ne 0 ]; then
+              echo "::error::${failures} required configuration option(s) failed."
+              exit 1
+            fi
+
+            echo "Required configuration checks passed."
+          } 2>&1 | tee ../config-check.log
+
+      
 
       - name: Download build sources
         run: |
