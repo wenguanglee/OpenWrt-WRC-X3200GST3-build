@@ -1,17 +1,18 @@
-请参考这个 # Build only. This workflow is NOT a no-serial partition migration installer.
+# Build only. This workflow is NOT a no-serial partition migration installer.
 # Replace .github/workflows/build.yml in your own repository with this file.
 # Standalone: no files other than this workflow are needed in your repository.
 # OpenWrt 25.12 uses APK. No flashing or automatic volume-resize commands are run.
-name: WRC-X3200GST3 25.12.6 109MiB - build only
+# Basic target defaults + standard LuCI; no Python/pip or extra language packs.
+# Host python3 below is a build tool, NOT a target firmware package.
+name: WRC-X3200GST3 25.12.6 109MiB - basic
 
 "on":
   workflow_dispatch:
-    inputs:
-      include_python:
-        description: 'Include Python 3 and pip (larger final image; NOT a transition image)'
-        type: boolean
-        required: true
-        default: true
+
+# Do not interrupt a running firmware build when another run is requested.
+concurrency:
+  group: wrc109m-basic-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -127,14 +128,20 @@ jobs:
             target/linux/mediatek/image/mt7622.mk | tee ../layout.patch
 
       - name: Install pinned release feeds and configure
-        env:
-          WITH_PYTHON: ${{ inputs.include_python }}
         run: |
           set -euo pipefail
           cd openwrt
-          # v25.12.6 feeds.conf.default already pins each feed to a commit.
           ./scripts/feeds update -a 2>&1 | tee ../feeds-update.log
           ./scripts/feeds install -a 2>&1 | tee ../feeds-install.log
+
+          # Exclude the unused LuCI recipe responsible for the known Kconfig cycle.
+          ./scripts/feeds uninstall luci-app-weechat 2>&1 | tee ../feeds-exclude.log
+          test ! -e package/feeds/luci/luci-app-weechat
+          test ! -L package/feeds/luci/luci-app-weechat
+          rm -f tmp/.packageinfo tmp/.config-package.in
+
+          # Let the selected device pull in its default drivers and base packages.
+          # LuCI is the standard web UI; its package manager comes as a dependency.
           cat > .config <<'CONFIG'
           CONFIG_TARGET_mediatek=y
           CONFIG_TARGET_mediatek_mt7622=y
@@ -144,33 +151,41 @@ jobs:
           # CONFIG_TARGET_ROOTFS_EROFS is not set
           CONFIG_USE_APK=y
           CONFIG_PACKAGE_luci=y
-          CONFIG_PACKAGE_luci-app-package-manager=y
-          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-          CONFIG_PACKAGE_ubi-utils=y
-          CONFIG_PACKAGE_uboot-envtools=y
-          CONFIG_PACKAGE_ca-bundle=y
+          # CONFIG_PACKAGE_python3 is not set
+          # CONFIG_PACKAGE_python3-pip is not set
           CONFIG
-          if [ "$WITH_PYTHON" = true ]; then
-            printf '\nCONFIG_PACKAGE_python3=y\nCONFIG_PACKAGE_python3-pip=y\n' >> .config
-          fi
-          make defconfig 2>&1 | tee ../defconfig.log
-          for symbol in \
-            CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3 \
-            CONFIG_TARGET_ROOTFS_INITRAMFS CONFIG_TARGET_ROOTFS_SQUASHFS \
-            CONFIG_USE_APK CONFIG_PACKAGE_luci CONFIG_PACKAGE_ubi-utils \
-            CONFIG_PACKAGE_luci-app-package-manager CONFIG_PACKAGE_luci-i18n-base-zh-cn; do
-            grep -qx "${symbol}=y" .config
-          done
-          if [ "$WITH_PYTHON" = true ]; then
-            grep -qx 'CONFIG_PACKAGE_python3=y' .config
-            grep -qx 'CONFIG_PACKAGE_python3-pip=y' .config
-          fi
+          cp .config ../config-before-defconfig.txt
+          make defconfig RECURSIVE_DEP_IS_ERROR=1 2>&1 | tee ../defconfig.log
+          cp .config ../config-after-defconfig.txt
+
+          {
+            for symbol in \
+              CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3 \
+              CONFIG_TARGET_ROOTFS_INITRAMFS CONFIG_TARGET_ROOTFS_SQUASHFS \
+              CONFIG_USE_APK CONFIG_PACKAGE_luci; do
+              if ! grep -qx "${symbol}=y" .config; then
+                echo "::error::Required option missing: ${symbol}=y"
+                exit 1
+              fi
+              echo "OK: ${symbol}=y"
+            done
+
+            # Fail instead of silently including Python through another dependency.
+            if grep -E '^CONFIG_PACKAGE_((python[0-9]*|libpython|micropython)[^=]*|pip|pip3)=(y|m)$' .config; then
+              echo '::error::Python-related target packages were unexpectedly selected.'
+              exit 1
+            fi
+            echo 'OK: no Python/pip target packages selected.'
+            echo 'Required configuration checks passed.'
+          } 2>&1 | tee ../config-check.log
+
+          grep -E '^CONFIG_PACKAGE_.*=y$' .config | sort > ../selected-packages.config
 
       - name: Download build sources
         run: |
           set -euo pipefail
           cd openwrt
-          make download -j4 2>&1 | tee ../download.log
+          (make download -j4 || make download -j1 V=s) 2>&1 | tee ../download.log
 
       - name: Compile (retry serially for a useful error log)
         run: |
@@ -194,7 +209,7 @@ jobs:
                   raise ValueError('Truncated FDT header')
               magic, total, off_struct, off_strings, _, _, _, _, str_size, struct_size = \
                   struct.unpack_from('>10I', data)
-              if magic != 0xd00dfeed or total > len(data):
+              if magic != 0xd00dfeed or not 40 <= total <= len(data):
                   raise ValueError('Invalid FDT/FIT header')
               if off_struct + struct_size > total or off_strings + str_size > total:
                   raise ValueError('Invalid FDT bounds')
@@ -238,6 +253,8 @@ jobs:
               # The upstream MT7622 mkits image embeds its DTB in a data property.
               dtb = fit[(f'/images/{fdt_name}', 'data')]
               props = parse_fdt(dtb)
+              if b'elecom,wrc-x3200gst3' not in props.get(('/', 'compatible'), b'').split(b'\0'):
+                  raise SystemExit(f'{title}: wrong board compatible')
               expected = {
                   'Preloader': (0x0, 0x80000),
                   'ATF': (0x80000, 0x40000),
@@ -283,8 +300,19 @@ jobs:
           output.mkdir(exist_ok=True)
           for image in sysup + ram:
               shutil.copy2(image, output / image.name)
-          for path in directory.glob('*elecom_wrc-x3200gst3*.manifest'):
+          manifests = sorted(directory.glob('*.manifest'))
+          if not manifests:
+              raise SystemExit('Missing firmware package manifest; refusing unchecked output')
+          for path in manifests:
+              names = [line.split()[0] for line in path.read_text().splitlines()
+                       if line.strip() and not line.lstrip().startswith('#')]
+              unwanted = [name for name in names
+                          if name.startswith(('python', 'libpython', 'micropython'))
+                          or name in ('pip', 'pip3')]
+              if unwanted:
+                  raise SystemExit(f'{path.name}: unexpected Python packages: {unwanted}')
               shutil.copy2(path, output / path.name)
+              print(f'{path.name}: no Python/pip packages in manifest')
           shutil.copy2('.config', output / 'full.config')
           shutil.copy2('feeds.conf.default', output / 'feeds.conf.default')
           print('Checks do not prove bootability or safe migration from the 19 MiB layout.')
@@ -292,6 +320,7 @@ jobs:
           ./scripts/diffconfig.sh > ../artifacts/build.config
           git rev-parse HEAD > ../artifacts/source-commit.txt
           cp ../layout.patch ../artifacts/layout.patch
+          cp ../selected-packages.config ../artifacts/selected-packages.config
           for feed in feeds/*; do
             if [ -d "$feed/.git" ] || [ -f "$feed/.git" ]; then
               printf '%s ' "${feed##*/}"
@@ -299,6 +328,7 @@ jobs:
             fi
           done > ../artifacts/feed-commits.txt
           printf '%s\n' \
+            'BASIC BUILD: device defaults + standard LuCI; no Python/pip selected.' \
             'BUILD OUTPUT ONLY. NOT A VALIDATED NO-SERIAL MIGRATION INSTALLER.' \
             'Do not directly force-flash this onto the current 19 MiB UBI layout.' \
             'initramfs is for RAM boot, never for writing to the 6 MiB kernel partition.' \
@@ -313,22 +343,28 @@ jobs:
       - name: Upload checked firmware artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: wrc-x3200gst3-25.12.6-109MiB-python-${{ inputs.include_python }}
+          name: wrc-x3200gst3-25.12.6-109MiB-basic
           path: artifacts/
           if-no-files-found: error
           retention-days: 30
+          compression-level: 0
 
       - name: Upload logs even after a failed build
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: wrc-x3200gst3-25.12.6-build-logs
+          name: wrc-x3200gst3-25.12.6-basic-build-logs
           path: |
             feeds-update.log
             feeds-install.log
+            feeds-exclude.log
+            config-before-defconfig.txt
+            config-after-defconfig.txt
+            selected-packages.config
+            config-check.log
             defconfig.log
             download.log
             build.log
             layout.patch
           if-no-files-found: warn
-          retention-days: 30 看看怎么修改
+          retention-days: 30
