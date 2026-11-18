@@ -1,16 +1,17 @@
-# WRC-X3200GST3 / MT7622 | OpenWrt 25.12.6 | 109 MiB UBI
-# Build-only. Not a validated 19 MiB -> 109 MiB migration or recovery installer.
-# Python3 below is needed on the GitHub runner for the OpenWrt build scripts;
-# Python3 and pip are NOT bundled in the router firmware.
-# kexec support is compiled, but board-specific runtime boot still requires validation.
+# 为 WRC-X3200GST3 编译 109 MiB 大分区 OpenWrt，并内置 kexec 支持
+# 首次迁移需串口；之后可通过 SSH + kexec 完成系统级恢复/更新
+# by deepseek
+name: WRC-X3200GST3 25.12.6 109MiB + kexec - no Python
 
-name: WRC-X3200GST3 109MiB v25.12.6 (kexec)
-
-on:
+"on":
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: wrc-109mib-kexec-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   OPENWRT_TAG: v25.12.6
@@ -23,25 +24,31 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Checkout the fixed upstream OpenWrt tag
-        uses: actions/checkout@v4
+      - name: Checkout fixed official OpenWrt source
+        uses: actions/checkout@v6
         with:
           repository: openwrt/openwrt
           ref: ${{ env.OPENWRT_TAG }}
           path: openwrt
           fetch-depth: 1
+          persist-credentials: false
 
-      - name: Install build dependencies
+      - name: Prepare ephemeral runner and install dependencies
         run: |
           set -euo pipefail
+          for sdk in /usr/local/lib/android /usr/share/dotnet /opt/ghc; do
+            if [ -d "$sdk" ]; then sudo rm -rf -- "$sdk"; fi
+          done
           sudo apt-get update
-          sudo apt-get install -y build-essential clang flex bison g++ gawk \
-            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
-            libelf-dev python3 python3-setuptools rsync swig unzip zlib1g-dev \
-            file wget curl cpio xz-utils zstd bzip2 ca-certificates
-          df -h .
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev libelf-dev python3 \
+            python3-setuptools rsync swig unzip zlib1g-dev file wget curl cpio \
+            xz-utils zstd bzip2 ca-certificates squashfs-tools binutils
+          mkdir -p diagnostics
+          df -h . | tee diagnostics/disk-before.txt
 
-      - name: Apply guarded 109 MiB layout changes
+      - name: Apply guarded 109 MiB UBI layout and enable kexec
         run: |
           set -euo pipefail
           cd openwrt
@@ -50,22 +57,22 @@ jobs:
           from pathlib import Path
           import re
 
-
           def replace_one(pattern, replacement, text, what):
               result, count = re.subn(pattern, replacement, text, flags=re.M)
               if count != 1:
                   raise SystemExit(f"Refusing to continue: {what}: expected 1 match, got {count}")
               return result
 
-
+          # ===== 1. 扩大 UBI 分区 =====
           dts = Path('target/linux/mediatek/dts/mt7622-elecom-wrc-x3200gst3.dts')
           mk = Path('target/linux/mediatek/image/mt7622.mk')
           s = dts.read_text()
-          # Refuse an unknown layout instead of silently guessing.
           if 'reg = <0x2c0000 0x600000>;' not in s:
               raise SystemExit('Unexpected kernel layout')
           s = replace_one(r'reg = <0x8c0000 0x1300000>;',
                           'reg = <0x8c0000 0x6d00000>;', s, 'UBI size')
+
+          # 删除四个无用分区（每个删除前都验证 label/reg/read-only）
           for address, label, size in [
               ('1bc0000', 'tm_pattern', '500000'),
               ('20c0000', 'tm_key', '100000'),
@@ -83,12 +90,16 @@ jobs:
                       'read-only;' not in block):
                   raise SystemExit('Unexpected partition definition: ' + label)
               s = re.sub(pattern, '', s, count=1, flags=re.M)
+
+          # BMT 重映射范围同步收缩
           s = replace_one(
               r'mediatek,bmt-remap-range\s*=\s*<0x0 0x8c0000>,\s*<0x1bc0000 0x30c0000>;',
               'mediatek,bmt-remap-range = <0x0 0x8c0000>;', s, 'BMT range')
+
           if len(re.findall(r'\bpartition@[0-9a-f]+\s*\{', s)) != 7:
               raise SystemExit('Unexpected number of MTD partition definitions')
 
+          # ===== 2. 修改镜像大小 =====
           m = mk.read_text()
           pattern = r'^define Device/elecom_wrc-x3200gst3\n.*?^endef$'
           blocks = list(re.finditer(pattern, m, re.M | re.S))
@@ -100,47 +111,55 @@ jobs:
           new = replace_one(r'IMAGE_SIZE := 25600k', 'IMAGE_SIZE := 117760k',
                             old, 'image size')
           m = m[:blocks[0].start()] + new + m[blocks[0].end():]
-          # Write only after all checks passed.
+
+          # ===== 3. 启用 aarch64 kexec（内核 + 用户态）=====
+          # 3a. kexec-tools 配方：添加 aarch64
+          p = Path('package/boot/kexec-tools/Makefile')
+          s2 = p.read_text()
+          old_recipe = '@(armeb||arm||i386||x86_64||powerpc64||mipsel||mips)'
+          new_recipe = '@(armeb||arm||aarch64||i386||x86_64||powerpc64||mipsel||mips)'
+          if s2.count(old_recipe) != 1:
+              raise SystemExit('Unexpected kexec recipe: refusing an unreviewed patch')
+          s2 = s2.replace(old_recipe, new_recipe, 1)
+
+          # 3b. 内核配置片段：启用 kexec 基础设施（不改 DTS 布局）
+          kcfg = Path('target/linux/mediatek/mt7622/config-6.12')
+          s3 = kcfg.read_text()
+          for key in ('SUSPEND', 'FW_CACHE', 'KEXEC', 'HOTPLUG_CPU', 'IKCONFIG', 'IKCONFIG_PROC'):
+              pattern = rf'^(?:CONFIG_{key}=.*|# CONFIG_{key} is not set)\n?'
+              s3 = re.sub(pattern, '', s3, flags=re.M)
+              s3 = s3.rstrip() + f'\nCONFIG_{key}=y\n'
+          for key in ('PM_AUTOSLEEP', 'PM_USERSPACE_AUTOSLEEP'):
+              pattern = rf'^(?:CONFIG_{key}=.*|# CONFIG_{key} is not set)\n?'
+              s3 = re.sub(pattern, '', s3, flags=re.M)
+              s3 = s3.rstrip() + f'\n# CONFIG_{key} is not set\n'
+
+          # 所有修改通过检查后，原子写入
           dts.write_text(s)
           mk.write_text(m)
-          print('UBI: 109 MiB; kernel: 6 MiB; end: 0x075c0000')
-          print('No bootloader, environment or factory/calibration definitions changed.')
+          p.write_text(s2)
+          kcfg.write_text(s3)
+          print('UBI: 109 MiB; kexec enabled; no DTS layout change beyond UBI expansion.')
           PY_PATCH
           git diff --check
-          git diff -- target/linux/mediatek/dts/mt7622-elecom-wrc-x3200gst3.dts \
-            target/linux/mediatek/image/mt7622.mk | tee ../layout.patch
+          git diff > ../diagnostics/source-changes.patch
 
-      - name: Install pinned release feeds and configure
+      - name: Prepare pinned feeds and exclude luci-app-weechat
         run: |
           set -euo pipefail
           cd openwrt
+          ./scripts/feeds update -a 2>&1 | tee ../diagnostics/feeds-update.log
+          ./scripts/feeds install -a 2>&1 | tee ../diagnostics/feeds-install.log
+          # 排除已知循环依赖：luci-app-weechat -> weechat-full -> weechat-minimal
+          ./scripts/feeds uninstall luci-app-weechat 2>&1 | tee ../diagnostics/feeds-exclude.log
+          test ! -e package/feeds/luci/luci-app-weechat
+          test ! -L package/feeds/luci/luci-app-weechat
+          rm -f tmp/.packageinfo tmp/.config-package.in
 
-          ./scripts/feeds update -a 2>&1 | tee ../feeds-update.log
-          ./scripts/feeds install -a 2>&1 | tee ../feeds-install.log
-
-          # Exclude the unused recipe that causes the Kconfig dependency cycle.
-          # uninstall only the installed feed recipe symlink, leaving other LuCI packages intact.
-          ./scripts/feeds uninstall luci-app-weechat 2>&1 | tee ../feeds-exclude.log
-          # Some feed combinations may expose the same recipe through a different link.
-          find package/feeds -maxdepth 2 -name 'luci-app-weechat' -print | tee -a ../feeds-exclude.log
-          if find package/feeds -mindepth 2 -maxdepth 2 -name 'luci-app-weechat' | grep -q .; then
-            echo '::error::luci-app-weechat still present in installed recipes'
-            exit 1
-          fi
-
-          if [ -e package/feeds/luci/luci-app-weechat ] || [ -L package/feeds/luci/luci-app-weechat ]; then
-            echo "::error::Failed to exclude luci-app-weechat"
-            exit 1
-          fi
-
-          # Invalidate cached package metadata after uninstalling the recipe.
-          rm -f tmp/.packageinfo tmp/.config-package.in tmp/.packagedeps
-
-          printf '%s\n' \
-            'Excluded unused feed recipe: luci-app-weechat.' \
-            'Enabled CONFIG_LUCI_LANG_zh_Hans=y.' \
-            > ../build-workarounds.txt
-
+      - name: Configure 109 MiB + kexec firmware without Python
+        run: |
+          set -euo pipefail
+          cd openwrt
           cat > .config <<'CONFIG'
           CONFIG_TARGET_mediatek=y
           CONFIG_TARGET_mediatek_mt7622=y
@@ -149,6 +168,14 @@ jobs:
           CONFIG_TARGET_ROOTFS_SQUASHFS=y
           # CONFIG_TARGET_ROOTFS_EROFS is not set
           CONFIG_USE_APK=y
+
+          # kexec：内核 + 用户态
+          CONFIG_KERNEL_KEXEC=y
+          CONFIG_PACKAGE_kexec=y
+          CONFIG_KEXEC_ZLIB=y
+          # CONFIG_KEXEC_LZMA is not set
+
+          # LuCI 与基础工具
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-app-package-manager=y
           CONFIG_LUCI_LANG_zh_Hans=y
@@ -156,249 +183,283 @@ jobs:
           CONFIG_PACKAGE_ubi-utils=y
           CONFIG_PACKAGE_uboot-envtools=y
           CONFIG_PACKAGE_ca-bundle=y
-          # Enable in-kernel kexec support plus the userspace loader.
-          # Does NOT prove this board can kexec its FIT/initramfs image.
-          CONFIG_KERNEL_KEXEC=y
-          CONFIG_PACKAGE_kexec-tools=y
-          # No Python interpreter or pip in firmware.
+
+          # 明确禁用 Python
           # CONFIG_PACKAGE_python3 is not set
           # CONFIG_PACKAGE_python3-pip is not set
           CONFIG
-
-          cp .config ../config-before-defconfig.txt
-
-          if make defconfig RECURSIVE_DEP_IS_ERROR=1 2>&1 | tee ../defconfig.log; then
-            cp .config ../config-after-defconfig.txt
-          else
-            cp .config ../config-after-defconfig.txt
-            echo "::error::make defconfig failed. See defconfig.log."
-            exit 1
-          fi
+          cp .config ../diagnostics/requested.config
+          make defconfig RECURSIVE_DEP_IS_ERROR=1 2>&1 | tee ../diagnostics/defconfig.log
+          cp .config ../diagnostics/full.config
 
           {
             failures=0
-
             check_symbol() {
               local symbol="$1"
               if grep -qx "${symbol}=y" .config; then
                 echo "OK: ${symbol}=y"
               else
-                echo "::error::Required option did not become y: ${symbol}"
+                echo "::error::Required option missing after defconfig: ${symbol}=y"
                 grep -n -F -- "$symbol" .config || true
                 failures=$((failures + 1))
               fi
             }
-
             for symbol in \
               CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3 \
               CONFIG_TARGET_ROOTFS_INITRAMFS CONFIG_TARGET_ROOTFS_SQUASHFS \
-              CONFIG_USE_APK CONFIG_PACKAGE_luci CONFIG_PACKAGE_ubi-utils \
-              CONFIG_PACKAGE_uboot-envtools CONFIG_PACKAGE_ca-bundle \
-              CONFIG_PACKAGE_luci-app-package-manager CONFIG_LUCI_LANG_zh_Hans \
-              CONFIG_PACKAGE_luci-i18n-base-zh-cn CONFIG_KERNEL_KEXEC \
-              CONFIG_PACKAGE_kexec-tools; do
+              CONFIG_USE_APK CONFIG_KERNEL_KEXEC CONFIG_PACKAGE_kexec \
+              CONFIG_PACKAGE_luci CONFIG_LUCI_LANG_zh_Hans \
+              CONFIG_PACKAGE_luci-i18n-base-zh-cn CONFIG_PACKAGE_luci-app-package-manager \
+              CONFIG_PACKAGE_ubi-utils CONFIG_PACKAGE_uboot-envtools CONFIG_PACKAGE_ca-bundle; do
               check_symbol "$symbol"
             done
-
-            # Fail if Python accidentally gets selected into the final firmware.
-            for symbol in CONFIG_PACKAGE_python3 CONFIG_PACKAGE_python3-pip; do
-              if grep -qx "${symbol}=y" .config; then
-                echo "::error::Unexpected firmware package: ${symbol}"
-                failures=$((failures + 1))
-              fi
-            done
-
+            # 确认没有 Python 混入
+            if grep -E '^CONFIG_PACKAGE_((python[0-9]*|libpython|micropython)[^=]*|pip|pip3)=(y|m)$' .config; then
+              echo '::error::Unexpected target Python package'
+              exit 1
+            fi
             if [ "$failures" -ne 0 ]; then
               echo "::error::${failures} required configuration option(s) failed."
               exit 1
             fi
+            echo 'Required configuration checks passed.'
+          } 2>&1 | tee ../diagnostics/config-check.log
 
-            echo "Required configuration checks passed."
-          } 2>&1 | tee ../config-check.log
-
-
-
-
-
-
-      - name: Download build sources
+      - name: Download sources
         run: |
           set -euo pipefail
           cd openwrt
-          make download -j4 2>&1 | tee ../download.log
+          make download -j4 2>&1 | tee ../diagnostics/download.log
 
-      - name: Compile (retry serially for a useful error log)
+      - name: Compile firmware with built-in kexec
         run: |
           set -euo pipefail
           cd openwrt
-          # A failed parallel build is retried serially for actionable diagnostics.
-          (make -j2 || make -j1 V=s) 2>&1 | tee ../build.log
+          (make -j2 || make -j1 V=s) 2>&1 | tee ../diagnostics/build.log
 
-      - name: Check both images and their embedded device trees
+      - name: Verify 109 MiB layout, kexec in kernel and SquashFS, no Python
         run: |
           set -euo pipefail
           cd openwrt
-          python3 - <<'PY_VERIFY'
+          python3 - <<'PY_VERIFY' 2>&1 | tee ../diagnostics/verify.log
           from pathlib import Path
-          import struct
-          import tarfile
-          import shutil
+          import gzip, lzma, re, shutil, struct, subprocess, tarfile, tempfile
 
+          out = Path('../artifacts'); out.mkdir(exist_ok=True)
+          diag = Path('../diagnostics')
 
-          def parse_fdt(data):
-              if len(data) < 40:
-                  raise ValueError('Truncated FDT header')
-              magic, total, off_struct, off_strings, _, _, _, _, str_size, struct_size = \
-                  struct.unpack_from('>10I', data)
-              if magic != 0xd00dfeed or total > len(data):
-                  raise ValueError('Invalid FDT/FIT header')
-              if off_struct + struct_size > total or off_strings + str_size > total:
-                  raise ValueError('Invalid FDT bounds')
-              strings = data[off_strings:off_strings + str_size]
-              pos, end = off_struct, off_struct + struct_size
+          def need(condition, message):
+              if not condition:
+                  raise SystemExit('ERROR: ' + message)
+
+          def one(items, description):
+              items = list(items)
+              need(len(items) == 1, f'{description}: expected exactly one, found {len(items)}')
+              return items[0]
+
+          # ===== 1. 验证实际内核 .config =====
+          kconfig = one(Path('build_dir').glob('target-*/linux-mediatek_mt7622/linux-*/.config'),
+                        'actual Linux .config')
+          values = set(kconfig.read_text().splitlines())
+          for key in ('ARM64', 'SUSPEND', 'PM_SLEEP_SMP', 'ARCH_SUPPORTS_KEXEC',
+                      'KEXEC', 'KEXEC_CORE', 'HOTPLUG_CPU', 'IKCONFIG', 'IKCONFIG_PROC'):
+              need(f'CONFIG_{key}=y' in values, f'kernel .config: CONFIG_{key}=y missing')
+          need('CONFIG_PM_AUTOSLEEP=y' not in values, 'automatic sleep must stay disabled')
+          shutil.copy2(kconfig, out / 'kernel-build.config')
+          print('OK: actual kernel .config has KEXEC + required infrastructure')
+
+          # ===== 2. 验证 autoconf.h =====
+          auto = kconfig.parent / 'include/generated/autoconf.h'
+          need(auto.is_file(), 'generated autoconf.h missing')
+          need('#define CONFIG_KEXEC 1' in auto.read_text(), 'KEXEC absent from compiled headers')
+
+          # ===== 3. FDT 解析（验证 109 MiB 布局）=====
+          def fdt(blob):
+              need(len(blob) >= 40, 'truncated FDT header')
+              magic, total, off, strings_off, _, version, _, _, string_size, size = \
+                  struct.unpack_from('>10I', blob)
+              need(magic == 0xd00dfeed and 17 <= version and total <= len(blob), 'invalid FDT header')
+              end = off + size
+              need(40 <= off <= end <= total and strings_off + string_size <= total, 'invalid FDT bounds')
+              strings = blob[strings_off:strings_off + string_size]
               stack, props = [], {}
-              while pos + 4 <= end:
-                  token = struct.unpack_from('>I', data, pos)[0]
-                  pos += 4
+              while off + 4 <= end:
+                  token = struct.unpack_from('>I', blob, off)[0]; off += 4
                   if token == 1:
-                      stop = data.index(b'\0', pos, end)
-                      stack.append(data[pos:stop].decode('ascii'))
-                      pos = (stop + 4) & ~3
+                      stop = blob.index(b'\0', off, end)
+                      stack.append(blob[off:stop].decode('ascii'))
+                      off = (stop + 4) & ~3
                   elif token == 2:
-                      if not stack:
-                          raise ValueError('Invalid FDT nesting')
-                      stack.pop()
+                      need(bool(stack), 'invalid FDT nesting'); stack.pop()
                   elif token == 3:
-                      length, name_off = struct.unpack_from('>II', data, pos)
-                      pos += 8
-                      if pos + length > end or name_off >= len(strings):
-                          raise ValueError('Invalid FDT property')
-                      name_end = strings.index(b'\0', name_off)
-                      name = strings[name_off:name_end].decode('ascii')
-                      path = '/' + '/'.join(part for part in stack if part)
-                      props[(path, name)] = data[pos:pos + length]
-                      pos = (pos + length + 3) & ~3
+                      length, nameoff = struct.unpack_from('>II', blob, off); off += 8
+                      need(off + length <= end and nameoff < len(strings), 'invalid FDT property')
+                      name = strings[nameoff:strings.index(b'\0', nameoff)].decode('ascii')
+                      path = '/' + '/'.join(v for v in stack if v)
+                      need((path, name) not in props, 'duplicate FDT property')
+                      props[path, name] = blob[off:off + length]
+                      off = (off + length + 3) & ~3
                   elif token == 4:
-                      continue
+                      pass
                   elif token == 9:
-                      return props
+                      need(not stack, 'unclosed FDT node'); return props
                   else:
-                      raise ValueError(f'Unexpected FDT token: {token}')
-              raise ValueError('No FDT end token')
+                      raise SystemExit(f'ERROR: unexpected FDT token {token}')
+              raise SystemExit('ERROR: missing FDT end token')
 
+          def string(value):
+              return value.rstrip(b'\0').decode('ascii')
 
-          def check_fit(blob, title):
-              fit = parse_fdt(blob)
-              cfg = fit[('/configurations', 'default')].rstrip(b'\0').decode()
-              fdt_name = fit[(f'/configurations/{cfg}', 'fdt')].rstrip(b'\0').decode()
-              # The upstream MT7622 mkits image embeds its DTB in a data property.
-              dtb = fit[(f'/images/{fdt_name}', 'data')]
-              props = parse_fdt(dtb)
-              expected = {
-                  'Preloader': (0x0, 0x80000),
-                  'ATF': (0x80000, 0x40000),
-                  'u-boot': (0xc0000, 0x80000),
-                  'u-boot-env': (0x140000, 0x80000),
-                  'factory': (0x1c0000, 0x100000),
-                  'kernel': (0x2c0000, 0x600000),
-                  'ubi': (0x8c0000, 0x6d00000),
-              }
+          expected = {
+              'Preloader': (0x0, 0x80000), 'ATF': (0x80000, 0x40000),
+              'u-boot': (0xc0000, 0x80000), 'u-boot-env': (0x140000, 0x80000),
+              'factory': (0x1c0000, 0x100000), 'kernel': (0x2c0000, 0x600000),
+              'ubi': (0x8c0000, 0x6d00000),   # ← 109 MiB
+          }
+
+          def check_fit(blob, title, work):
+              fit = fdt(blob)
+              cfg = '/configurations/' + string(fit['/configurations', 'default'])
+              dt_node = '/images/' + string(fit[cfg, 'fdt'])
+              props = fdt(fit[dt_node, 'data'])
+              need(b'elecom,wrc-x3200gst3\0' in props['/', 'compatible'], 'wrong board DTB')
               actual = {}
               for (path, name), value in props.items():
                   if name == 'label' and '/partitions/partition@' in path:
-                      label = value.rstrip(b'\0').decode()
-                      actual[label] = struct.unpack('>II', props[(path, 'reg')])
-              if actual != expected:
-                  raise SystemExit(f'{title}: unexpected MTD layout: {actual}')
+                      label = string(value)
+                      need(label not in actual, 'duplicate partition label')
+                      actual[label] = struct.unpack('>II', props[path, 'reg'])
+              need(actual == expected, f'{title}: NOT the 109 MiB layout: {actual}')
               bmt = [v for (p, n), v in props.items() if n == 'mediatek,bmt-remap-range']
-              if bmt != [struct.pack('>II', 0, 0x8c0000)]:
-                  raise SystemExit(f'{title}: unexpected BMT mapping')
-              print(f'{title}: embedded DTB has the expected 109 MiB layout')
+              need(bmt == [struct.pack('>2I', 0, 0x8c0000)], f'{title}: BMT mapping changed')
+              print(f'OK: {title}: 7 partitions; UBI = 109 MiB')
 
+              # 提取内核并验证嵌入式 kexec 配置
+              knode = '/images/' + string(fit[cfg, 'kernel'])
+              raw = fit[knode, 'data']
+              comp = string(fit.get((knode, 'compression'), b'none\0'))
+              if comp == 'lzma':
+                  raw = lzma.decompress(raw, format=lzma.FORMAT_ALONE)
+              elif comp == 'gzip':
+                  raw = gzip.decompress(raw)
+              else:
+                  need(comp == 'none', f'unhandled kernel compression: {comp}')
+              need(len(raw) >= 64 and raw[56:60] == b'ARM\x64', 'not an ARM64 Image')
+              image = work / (title + '-Image'); image.write_bytes(raw)
+              result = subprocess.run(
+                  ['sh', str(kconfig.parent / 'scripts/extract-ikconfig'), str(image)],
+                  check=True, capture_output=True, text=True)
+              embedded = set(result.stdout.splitlines())
+              for key in ('KEXEC', 'KEXEC_CORE', 'ARM64'):
+                  need(f'CONFIG_{key}=y' in embedded, f'{title}: embedded kernel missing CONFIG_{key}=y')
+              print(f'OK: {title}: embedded kernel contains KEXEC')
+              (out / (title + '-kernel.config')).write_text(result.stdout)
 
           directory = Path('bin/targets/mediatek/mt7622')
-          sysup = list(directory.glob('*elecom_wrc-x3200gst3-squashfs-sysupgrade.bin'))
-          ram = list(directory.glob('*elecom_wrc-x3200gst3-initramfs-kernel.bin'))
-          if len(sysup) != 1 or len(ram) != 1:
-              raise SystemExit('Expected exactly one sysupgrade and one initramfs image')
-          with tarfile.open(sysup[0], 'r:') as archive:
-              kernels = [m for m in archive if m.isfile() and m.name.endswith('/kernel')]
-              roots = [m for m in archive if m.isfile() and m.name.endswith('/root')]
-              if len(kernels) != 1 or len(roots) != 1:
-                  raise SystemExit('Unexpected sysupgrade archive layout')
-              if not 0 < kernels[0].size <= 6 * 1024 * 1024:
-                  raise SystemExit('Kernel is empty or exceeds 6 MiB')
-              if not 0 < roots[0].size < 109 * 1024 * 1024:
-                  raise SystemExit('Rootfs size is implausible for this layout')
-              if archive.extractfile(roots[0]).read(4) != b'hsqs':
-                  raise SystemExit('Expected a SquashFS root filesystem')
-              check_fit(archive.extractfile(kernels[0]).read(), 'sysupgrade kernel')
-              print('Kernel bytes:', kernels[0].size, 'Rootfs bytes:', roots[0].size)
-          check_fit(ram[0].read_bytes(), 'initramfs')
-          output = Path('../artifacts')
-          output.mkdir(exist_ok=True)
-          for image in sysup + ram:
-              shutil.copy2(image, output / image.name)
-          for path in directory.glob('*elecom_wrc-x3200gst3*.manifest'):
-              shutil.copy2(path, output / path.name)
-          shutil.copy2('.config', output / 'full.config')
-          shutil.copy2('feeds.conf.default', output / 'feeds.conf.default')
-          # Check userspace kexec binary presence in the squashfs manifest.
-          manifests = list(directory.glob('*elecom_wrc-x3200gst3*.manifest'))
-          if len(manifests) != 1:
-              raise SystemExit(f'Expected one package manifest, found {len(manifests)}')
-          manifest = manifests[0].read_text()
-          if not any(line.split(' - ', 1)[0] == 'kexec-tools' for line in manifest.splitlines()):
-              raise SystemExit('kexec-tools is absent from package manifest')
-          print('kexec-tools included; this is not proof of a successful kexec boot')
-          print('Checks do not prove bootability or safe migration from the 19 MiB layout.')
+          sysup = one(directory.glob('*elecom_wrc-x3200gst3-squashfs-sysupgrade.bin'), 'sysupgrade')
+          ram = one(directory.glob('*elecom_wrc-x3200gst3-initramfs-kernel.bin'), 'initramfs')
+
+          with tempfile.TemporaryDirectory(prefix='verify-109mib-') as temp:
+              work = Path(temp)
+              with tarfile.open(sysup, 'r:') as archive:
+                  kernel = one((m for m in archive.getmembers()
+                                if m.isfile() and m.name.endswith('/kernel')), 'tar kernel')
+                  root = one((m for m in archive.getmembers()
+                              if m.isfile() and m.name.endswith('/root')), 'tar rootfs')
+                  need(0 < kernel.size <= 6 * 1024 * 1024, 'kernel exceeds 6 MiB partition')
+                  need(0 < root.size < 109 * 1024 * 1024, 'rootfs exceeds 109 MiB UBI')
+                  rootfile = work / 'root.squashfs'
+                  with archive.extractfile(root) as source, rootfile.open('wb') as dest:
+                      shutil.copyfileobj(source, dest)
+                  with rootfile.open('rb') as source:
+                      need(source.read(4) == b'hsqs', 'rootfs is not SquashFS')
+                  check_fit(archive.extractfile(kernel).read(), 'sysupgrade', work)
+                  print(f'OK: kernel={kernel.size} bytes; SquashFS={root.size} bytes')
+
+              check_fit(ram.read_bytes(), 'initramfs', work)
+
+              # 从 SquashFS 提取 kexec 二进制并验证
+              extracted = work / 'root'
+              subprocess.run(['unsquashfs', '-no-progress', '-d', str(extracted),
+                              str(rootfile), 'usr/sbin/kexec'], check=True)
+              binary = extracted / 'usr/sbin/kexec'
+              need(binary.is_file() and not binary.is_symlink(), 'kexec not found in SquashFS')
+              data = binary.read_bytes()
+              need(len(data) >= 64 and data[:4] == b'\x7fELF'
+                   and data[4:6] == b'\x02\x01', 'kexec is not ELF64 little-endian')
+              need(struct.unpack_from('<H', data, 18)[0] == 183,
+                   'kexec is not an AArch64 executable')
+              need(bool(binary.stat().st_mode & 0o111), 'kexec is not executable')
+              print('OK: SquashFS contains executable AArch64 /usr/sbin/kexec')
+
+          # ===== 4. 验证 manifest 中无 Python、有 kexec =====
+          manifests = list(directory.glob('*.manifest'))
+          need(bool(manifests), 'package manifest missing')
+          matched = []
+          for manifest in manifests:
+              names = {line.split()[0] for line in manifest.read_text().splitlines() if line.strip()}
+              if 'kexec' in names:
+                  need(not any(re.match(r'^(python[0-9]*|libpython|micropython|pip(?:3)?$)', n)
+                               for n in names), 'unexpected Python in manifest')
+                  matched.append(manifest)
+                  shutil.copy2(manifest, out / manifest.name)
+          need(bool(matched), 'kexec missing from package manifest')
+          print('OK: manifest contains kexec and no Python')
+
+          # 拷贝产物
+          for image in (sysup, ram):
+              shutil.copy2(image, out / image.name)
+          shutil.copy2('.config', out / 'full.config')
+          shutil.copy2('feeds.conf.default', out / 'feeds.conf.default')
+          print('All build checks passed.')
           PY_VERIFY
+
+      - name: Collect provenance and checksums
+        run: |
+          set -euo pipefail
+          cd openwrt
           ./scripts/diffconfig.sh > ../artifacts/build.config
           git rev-parse HEAD > ../artifacts/source-commit.txt
-          cp ../layout.patch ../artifacts/layout.patch
+          git diff > ../artifacts/source-changes.patch
           for feed in feeds/*; do
             if [ -d "$feed/.git" ] || [ -f "$feed/.git" ]; then
               printf '%s ' "${feed##*/}"
               git -C "$feed" rev-parse HEAD
             fi
           done > ../artifacts/feed-commits.txt
-          printf '%s\n' \
-            'BUILD OUTPUT ONLY. NOT A VALIDATED NO-SERIAL MIGRATION INSTALLER.' \
-            'Do not directly force-flash this onto the current 19 MiB UBI layout.' \
-            'initramfs is for RAM boot, never for writing to the 6 MiB kernel partition.' \
-            'kexec support is experimental on this board; no tested RAM boot path is provided.' \
-            'A FIT initramfs-kernel.bin may not be directly loadable with kexec -l.' \
-            'No automatic rootfs_data resize service is included.' \
-            'Back up all affected MTD partitions before any migration.' \
-            'Future firmware must retain the same partition layout.' \
-            > ../artifacts/READ-BEFORE-FLASH.txt
+          cp ../diagnostics/verify.log ../artifacts/verification.txt
+          cat > ../artifacts/READ-BEFORE-FLASH.txt <<'NOTICE'
+          WRC-X3200GST3 / OpenWrt 25.12.6 / 109 MiB UBI layout + kexec
+          =================================================================
+          This firmware uses the EXPANDED 109 MiB UBI layout.
+          Do NOT flash it onto a device that still has the original 19 MiB layout.
+          First migration from 19 MiB to 109 MiB requires serial (mtk_uartboot) + initramfs.
+          Once on 109 MiB, later updates can be done via SSH + kexec without serial.
+          No Python runtime is included.
+          Kernel KEXEC support and userspace /usr/sbin/kexec are build-verified.
+          Device-level kexec reboot, migration safety, UBI bad-block handling,
+          and watchdog behavior are NOT validated by this workflow.
+          Back up all MTD partitions and configuration before any migration attempt.
+          Keep the same partition layout for all future firmware.
+          NOTICE
           cd ../artifacts
-          sha256sum *.bin > SHA256SUMS
+          find . -type f ! -name SHA256SUMS -print0 | sort -z |
+            xargs -0 sha256sum > SHA256SUMS
           ls -lh
 
-      - name: Upload checked firmware artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload verified firmware only
+        uses: actions/upload-artifact@v6
         with:
-          name: wrc-x3200gst3-25.12.6-109MiB-kexec
+          name: WRC-X3200GST3-25.12.6-109MiB-kexec
           path: artifacts/
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload logs even after a failed build
+      - name: Upload diagnostics even on failure
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: wrc-x3200gst3-build-logs
-          path: |
-            download.log
-            build.log
-            layout.patch
-            feeds-update.log
-            feeds-install.log
-            feeds-exclude.log
-            defconfig.log
-            config-check.log
-            config-before-defconfig.txt
-            config-after-defconfig.txt
+          name: WRC-X3200GST3-25.12.6-109MiB-kexec-logs
+          path: diagnostics/
           if-no-files-found: warn
           retention-days: 30
