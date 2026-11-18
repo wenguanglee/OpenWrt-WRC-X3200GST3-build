@@ -1,7 +1,7 @@
 # 为 WRC-X3200GST3 编译 109 MiB 大分区 OpenWrt，并内置 kexec 支持
 # 首次迁移需串口；之后可通过 SSH + kexec 完成系统级恢复/更新
 # by deepseek
-name: WRC-X3200GST3 25.12.6 109MiB + kexec - no Python
+name: WRC-X3200GST3 25.12.6 109MiB + kexec - by deepseek
 
 "on":
   workflow_dispatch:
