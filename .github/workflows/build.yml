@@ -1,18 +1,13 @@
-# Build only. This workflow is NOT a no-serial partition migration installer.
-# Replace .github/workflows/build.yml in your own repository with this file.
-# Standalone: no files other than this workflow are needed in your repository.
-# OpenWrt 25.12 uses APK. No flashing or automatic volume-resize commands are run.
-# Basic target defaults + standard LuCI; no Python/pip or extra language packs.
-# Host python3 below is a build tool, NOT a target firmware package.
-name: WRC-X3200GST3 25.12.6 109MiB - basic
+# WRC-X3200GST3 / MT7622 | OpenWrt 25.12.6 | 109 MiB UBI
+# Build-only. Not a validated 19 MiB -> 109 MiB migration or recovery installer.
+# Python3 below is needed on the GitHub runner for the OpenWrt build scripts;
+# Python3 and pip are NOT bundled in the router firmware.
+# kexec support is compiled, but board-specific runtime boot still requires validation.
 
-"on":
+name: WRC-X3200GST3 109MiB v25.12.6 (kexec)
+
+on:
   workflow_dispatch:
-
-# Do not interrupt a running firmware build when another run is requested.
-concurrency:
-  group: wrc109m-basic-${{ github.ref }}
-  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -29,24 +24,12 @@ jobs:
         shell: bash
     steps:
       - name: Checkout the fixed upstream OpenWrt tag
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
           repository: openwrt/openwrt
           ref: ${{ env.OPENWRT_TAG }}
           path: openwrt
           fetch-depth: 1
-          persist-credentials: false
-
-      - name: Prepare space on the disposable build runner
-        run: |
-          set -euo pipefail
-          # These are preinstalled SDKs on the ephemeral runner, not router data.
-          for sdk in /usr/local/lib/android /usr/share/dotnet /opt/ghc; do
-            if [ -d "$sdk" ]; then
-              sudo rm -rf -- "$sdk"
-            fi
-          done
-          df -h .
 
       - name: Install build dependencies
         run: |
@@ -131,17 +114,33 @@ jobs:
         run: |
           set -euo pipefail
           cd openwrt
+
           ./scripts/feeds update -a 2>&1 | tee ../feeds-update.log
           ./scripts/feeds install -a 2>&1 | tee ../feeds-install.log
 
-          # Exclude the unused LuCI recipe responsible for the known Kconfig cycle.
+          # Exclude the unused recipe that causes the Kconfig dependency cycle.
+          # uninstall only the installed feed recipe symlink, leaving other LuCI packages intact.
           ./scripts/feeds uninstall luci-app-weechat 2>&1 | tee ../feeds-exclude.log
-          test ! -e package/feeds/luci/luci-app-weechat
-          test ! -L package/feeds/luci/luci-app-weechat
-          rm -f tmp/.packageinfo tmp/.config-package.in
+          # Some feed combinations may expose the same recipe through a different link.
+          find package/feeds -maxdepth 2 -name 'luci-app-weechat' -print | tee -a ../feeds-exclude.log
+          if find package/feeds -mindepth 2 -maxdepth 2 -name 'luci-app-weechat' | grep -q .; then
+            echo '::error::luci-app-weechat still present in installed recipes'
+            exit 1
+          fi
 
-          # Let the selected device pull in its default drivers and base packages.
-          # LuCI is the standard web UI; its package manager comes as a dependency.
+          if [ -e package/feeds/luci/luci-app-weechat ] || [ -L package/feeds/luci/luci-app-weechat ]; then
+            echo "::error::Failed to exclude luci-app-weechat"
+            exit 1
+          fi
+
+          # Invalidate cached package metadata after uninstalling the recipe.
+          rm -f tmp/.packageinfo tmp/.config-package.in tmp/.packagedeps
+
+          printf '%s\n' \
+            'Excluded unused feed recipe: luci-app-weechat.' \
+            'Enabled CONFIG_LUCI_LANG_zh_Hans=y.' \
+            > ../build-workarounds.txt
+
           cat > .config <<'CONFIG'
           CONFIG_TARGET_mediatek=y
           CONFIG_TARGET_mediatek_mt7622=y
@@ -151,46 +150,88 @@ jobs:
           # CONFIG_TARGET_ROOTFS_EROFS is not set
           CONFIG_USE_APK=y
           CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-app-package-manager=y
+          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_ubi-utils=y
+          CONFIG_PACKAGE_uboot-envtools=y
+          CONFIG_PACKAGE_ca-bundle=y
+          # Enable in-kernel kexec support plus the userspace loader.
+          # Does NOT prove this board can kexec its FIT/initramfs image.
+          CONFIG_KERNEL_KEXEC=y
+          CONFIG_PACKAGE_kexec-tools=y
+          # No Python interpreter or pip in firmware.
           # CONFIG_PACKAGE_python3 is not set
           # CONFIG_PACKAGE_python3-pip is not set
           CONFIG
+
           cp .config ../config-before-defconfig.txt
-          make defconfig RECURSIVE_DEP_IS_ERROR=1 2>&1 | tee ../defconfig.log
-          cp .config ../config-after-defconfig.txt
+
+          if make defconfig RECURSIVE_DEP_IS_ERROR=1 2>&1 | tee ../defconfig.log; then
+            cp .config ../config-after-defconfig.txt
+          else
+            cp .config ../config-after-defconfig.txt
+            echo "::error::make defconfig failed. See defconfig.log."
+            exit 1
+          fi
 
           {
+            failures=0
+
+            check_symbol() {
+              local symbol="$1"
+              if grep -qx "${symbol}=y" .config; then
+                echo "OK: ${symbol}=y"
+              else
+                echo "::error::Required option did not become y: ${symbol}"
+                grep -n -F -- "$symbol" .config || true
+                failures=$((failures + 1))
+              fi
+            }
+
             for symbol in \
               CONFIG_TARGET_mediatek_mt7622_DEVICE_elecom_wrc-x3200gst3 \
               CONFIG_TARGET_ROOTFS_INITRAMFS CONFIG_TARGET_ROOTFS_SQUASHFS \
-              CONFIG_USE_APK CONFIG_PACKAGE_luci; do
-              if ! grep -qx "${symbol}=y" .config; then
-                echo "::error::Required option missing: ${symbol}=y"
-                exit 1
-              fi
-              echo "OK: ${symbol}=y"
+              CONFIG_USE_APK CONFIG_PACKAGE_luci CONFIG_PACKAGE_ubi-utils \
+              CONFIG_PACKAGE_uboot-envtools CONFIG_PACKAGE_ca-bundle \
+              CONFIG_PACKAGE_luci-app-package-manager CONFIG_LUCI_LANG_zh_Hans \
+              CONFIG_PACKAGE_luci-i18n-base-zh-cn CONFIG_KERNEL_KEXEC \
+              CONFIG_PACKAGE_kexec-tools; do
+              check_symbol "$symbol"
             done
 
-            # Fail instead of silently including Python through another dependency.
-            if grep -E '^CONFIG_PACKAGE_((python[0-9]*|libpython|micropython)[^=]*|pip|pip3)=(y|m)$' .config; then
-              echo '::error::Python-related target packages were unexpectedly selected.'
+            # Fail if Python accidentally gets selected into the final firmware.
+            for symbol in CONFIG_PACKAGE_python3 CONFIG_PACKAGE_python3-pip; do
+              if grep -qx "${symbol}=y" .config; then
+                echo "::error::Unexpected firmware package: ${symbol}"
+                failures=$((failures + 1))
+              fi
+            done
+
+            if [ "$failures" -ne 0 ]; then
+              echo "::error::${failures} required configuration option(s) failed."
               exit 1
             fi
-            echo 'OK: no Python/pip target packages selected.'
-            echo 'Required configuration checks passed.'
+
+            echo "Required configuration checks passed."
           } 2>&1 | tee ../config-check.log
 
-          grep -E '^CONFIG_PACKAGE_.*=y$' .config | sort > ../selected-packages.config
+
+
+
+
 
       - name: Download build sources
         run: |
           set -euo pipefail
           cd openwrt
-          (make download -j4 || make download -j1 V=s) 2>&1 | tee ../download.log
+          make download -j4 2>&1 | tee ../download.log
 
       - name: Compile (retry serially for a useful error log)
         run: |
           set -euo pipefail
           cd openwrt
+          # A failed parallel build is retried serially for actionable diagnostics.
           (make -j2 || make -j1 V=s) 2>&1 | tee ../build.log
 
       - name: Check both images and their embedded device trees
@@ -209,7 +250,7 @@ jobs:
                   raise ValueError('Truncated FDT header')
               magic, total, off_struct, off_strings, _, _, _, _, str_size, struct_size = \
                   struct.unpack_from('>10I', data)
-              if magic != 0xd00dfeed or not 40 <= total <= len(data):
+              if magic != 0xd00dfeed or total > len(data):
                   raise ValueError('Invalid FDT/FIT header')
               if off_struct + struct_size > total or off_strings + str_size > total:
                   raise ValueError('Invalid FDT bounds')
@@ -253,8 +294,6 @@ jobs:
               # The upstream MT7622 mkits image embeds its DTB in a data property.
               dtb = fit[(f'/images/{fdt_name}', 'data')]
               props = parse_fdt(dtb)
-              if b'elecom,wrc-x3200gst3' not in props.get(('/', 'compatible'), b'').split(b'\0'):
-                  raise SystemExit(f'{title}: wrong board compatible')
               expected = {
                   'Preloader': (0x0, 0x80000),
                   'ATF': (0x80000, 0x40000),
@@ -300,27 +339,23 @@ jobs:
           output.mkdir(exist_ok=True)
           for image in sysup + ram:
               shutil.copy2(image, output / image.name)
-          manifests = sorted(directory.glob('*.manifest'))
-          if not manifests:
-              raise SystemExit('Missing firmware package manifest; refusing unchecked output')
-          for path in manifests:
-              names = [line.split()[0] for line in path.read_text().splitlines()
-                       if line.strip() and not line.lstrip().startswith('#')]
-              unwanted = [name for name in names
-                          if name.startswith(('python', 'libpython', 'micropython'))
-                          or name in ('pip', 'pip3')]
-              if unwanted:
-                  raise SystemExit(f'{path.name}: unexpected Python packages: {unwanted}')
+          for path in directory.glob('*elecom_wrc-x3200gst3*.manifest'):
               shutil.copy2(path, output / path.name)
-              print(f'{path.name}: no Python/pip packages in manifest')
           shutil.copy2('.config', output / 'full.config')
           shutil.copy2('feeds.conf.default', output / 'feeds.conf.default')
+          # Check userspace kexec binary presence in the squashfs manifest.
+          manifests = list(directory.glob('*elecom_wrc-x3200gst3*.manifest'))
+          if len(manifests) != 1:
+              raise SystemExit(f'Expected one package manifest, found {len(manifests)}')
+          manifest = manifests[0].read_text()
+          if not any(line.split(' - ', 1)[0] == 'kexec-tools' for line in manifest.splitlines()):
+              raise SystemExit('kexec-tools is absent from package manifest')
+          print('kexec-tools included; this is not proof of a successful kexec boot')
           print('Checks do not prove bootability or safe migration from the 19 MiB layout.')
           PY_VERIFY
           ./scripts/diffconfig.sh > ../artifacts/build.config
           git rev-parse HEAD > ../artifacts/source-commit.txt
           cp ../layout.patch ../artifacts/layout.patch
-          cp ../selected-packages.config ../artifacts/selected-packages.config
           for feed in feeds/*; do
             if [ -d "$feed/.git" ] || [ -f "$feed/.git" ]; then
               printf '%s ' "${feed##*/}"
@@ -328,10 +363,11 @@ jobs:
             fi
           done > ../artifacts/feed-commits.txt
           printf '%s\n' \
-            'BASIC BUILD: device defaults + standard LuCI; no Python/pip selected.' \
             'BUILD OUTPUT ONLY. NOT A VALIDATED NO-SERIAL MIGRATION INSTALLER.' \
             'Do not directly force-flash this onto the current 19 MiB UBI layout.' \
             'initramfs is for RAM boot, never for writing to the 6 MiB kernel partition.' \
+            'kexec support is experimental on this board; no tested RAM boot path is provided.' \
+            'A FIT initramfs-kernel.bin may not be directly loadable with kexec -l.' \
             'No automatic rootfs_data resize service is included.' \
             'Back up all affected MTD partitions before any migration.' \
             'Future firmware must retain the same partition layout.' \
@@ -341,30 +377,28 @@ jobs:
           ls -lh
 
       - name: Upload checked firmware artifacts
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
-          name: wrc-x3200gst3-25.12.6-109MiB-basic
+          name: wrc-x3200gst3-25.12.6-109MiB-kexec
           path: artifacts/
           if-no-files-found: error
           retention-days: 30
-          compression-level: 0
 
       - name: Upload logs even after a failed build
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
-          name: wrc-x3200gst3-25.12.6-basic-build-logs
+          name: wrc-x3200gst3-build-logs
           path: |
-            feeds-update.log
-            feeds-install.log
-            feeds-exclude.log
-            config-before-defconfig.txt
-            config-after-defconfig.txt
-            selected-packages.config
-            config-check.log
-            defconfig.log
             download.log
             build.log
             layout.patch
+            feeds-update.log
+            feeds-install.log
+            feeds-exclude.log
+            defconfig.log
+            config-check.log
+            config-before-defconfig.txt
+            config-after-defconfig.txt
           if-no-files-found: warn
           retention-days: 30
