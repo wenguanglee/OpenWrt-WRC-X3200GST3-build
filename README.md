@@ -155,7 +155,7 @@ df -h /overlay
 
 **后续升级继续使用相同 109 MiB 分区布局的固件，不直接刷回官方小分区固件或 KEXEC 原分区过渡固件。**
 
----
+## 7. 追加解释
 已经测试成功。
 wrc-x3200gst3-openwrt-KERNEL-KEXEC 包含 原厂分区 过度image  19M-KEXEC-initramfs.bin 和 19M-KEXEC-sysupgrade.bin
 OpenWrt-WRC-X3200GST3-build 包含 109M 大分区 109M-KEXEC-initramfs.bin 和 109M-KEXEC-sysupgrade.bin
