@@ -157,11 +157,20 @@ df -h /overlay
 
 ## 7. 追加解释
 已经测试成功。
+
 wrc-x3200gst3-openwrt-KERNEL-KEXEC 包含 原厂分区 过度image  19M-KEXEC-initramfs.bin 和 19M-KEXEC-sysupgrade.bin
+
 OpenWrt-WRC-X3200GST3-build 包含 109M 大分区 109M-KEXEC-initramfs.bin 和 109M-KEXEC-sysupgrade.bin
+
 刷机步骤 
+
 1 刷入主线openwrt factory 固件
+
 2 在openwrt 里面 sysupgrade 升级 带kexec 程序的wrc-x3200gst3-openwrt-KERNEL-KEXEC  19M-KEXEC-sysupgrade.bin
+
 3 在新的kexec openwrt 里面 使用上面描述细节 启动 大分区   109M-KEXEC-initramfs.bin 
+
 4 在大分区 ramfs里面 openwrt 页面 刷写 大分区  109M-KEXEC-sysupgrade.bin
+
 反过来 从大分区恢复小分区应该也能正常。但是没有测试。
+
