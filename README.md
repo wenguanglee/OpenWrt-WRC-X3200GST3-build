@@ -12,10 +12,10 @@
 
 | 文中使用的文件名 | 对应文件来源 | 作用 |
 | --- | --- | --- |
-| `bridge-sysupgrade.bin` | **原始分区 KEXEC 构建**的 `…squashfs-sysupgrade.bin` | 先刷入闪存，保持 19 MiB UBI，同时提供内核 KEXEC 支持和用户态 `kexec` 程序 |
-| `initramfs.bin` | **109 MiB 大分区构建**的 `…initramfs-kernel.bin` | 临时运行在 RAM 中，内置大分区设备树；由脚本拆包后交给 kexec 启动 |
-| `large-sysupgrade.bin` | **109 MiB 大分区构建**的 `…squashfs-sysupgrade.bin` | 最后在大分区 RAM 系统中刷入闪存，作为日常使用的正式系统 |
-| `boot-large-no-wdt.sh` | 本目录附带的启动脚本 | 自动提取组件、解压内核、处理临时看门狗配置并执行 RAM 启动；不执行正式刷写 |
+| `19M-KEXEC-sysupgrade.bin` | **原始分区 KEXEC 构建**的 `…squashfs-sysupgrade.bin` | 先刷入闪存，保持 19 MiB UBI，同时提供内核 KEXEC 支持和用户态 `kexec` 程序 |
+| `109M-initramfs.bin` | **109 MiB 大分区构建**的 `…initramfs-kernel.bin` | 临时运行在 RAM 中，内置大分区设备树；由脚本拆包后交给 kexec 启动 |
+| `109M-KEXEC-sysupgrade.bin` | **109 MiB 大分区构建**的 `…squashfs-sysupgrade.bin` | 最后在大分区 RAM 系统中刷入闪存，作为日常使用的正式系统 |
+| `boot-initramfs.sh` | 本目录附带的启动脚本 | 自动提取组件、解压内核、处理临时看门狗配置并执行 RAM 启动；不执行正式刷写 |
 
 **两份 sysupgrade 的原文件名可能相同，必须按构建来源区分。重命名不会改变镜像内容。此流程不使用 `factory.bin`，也不能把 initramfs 当成 sysupgrade 刷入。**
 
@@ -35,14 +35,14 @@
 **电脑终端：**在文件所在目录上传。
 
 ```sh
-scp -O bridge-sysupgrade.bin root@192.168.1.1:/tmp/bridge-sysupgrade.bin
+scp -O 19M-KEXEC-sysupgrade.bin root@192.168.1.1:/tmp/19M-KEXEC-sysupgrade.bin
 ```
 
 **路由器 SSH：**核对 SHA256，然后检查并刷写。
 
 ```sh
-sha256sum /tmp/bridge-sysupgrade.bin
-sysupgrade -T /tmp/bridge-sysupgrade.bin && sysupgrade -n /tmp/bridge-sysupgrade.bin
+sha256sum /tmp/19M-KEXEC-sysupgrade.bin
+sysupgrade -T /tmp/19M-KEXEC-sysupgrade.bin && sysupgrade -n /tmp/19M-KEXEC-sysupgrade.bin
 ```
 
 重启后重新连接，确认 `kexec` 可以运行：
@@ -76,7 +76,7 @@ apk update && apk add dumpimage fdt-utils xz
 **电脑终端：**上传大分区 RAM 镜像和脚本。不要提前把正式镜像只放在路由器 `/tmp`，切换内核后旧 `/tmp` 的文件不会保留。
 
 ```sh
-scp -O initramfs.bin boot-large-no-wdt.sh root@192.168.1.1:/tmp/
+scp -O 109M-initramfs.bin boot-initramfs.sh root@192.168.1.1:/tmp/
 ```
 
 RAM 启动阶段可将电脑有线网卡设为 **`192.168.1.2/24`**，继续连接 LAN，避免依赖 DHCP 获取地址。
@@ -124,19 +124,19 @@ mtd6: 06d00000 00020000 "ubi"
 **电脑终端：**重新上传正式大分区镜像。
 
 ```sh
-scp -O large-sysupgrade.bin root@192.168.1.1:/tmp/large-sysupgrade.bin
+scp -O 109M-KEXEC-sysupgrade.bin root@192.168.1.1:/tmp/109M-KEXEC-sysupgrade.bin
 ```
 
 **路由器 SSH：**核对 SHA256 与电脑下载包中的对应值一致。
 
 ```sh
-sha256sum /tmp/large-sysupgrade.bin
+sha256sum /tmp/109M-KEXEC-sysupgrade.bin
 ```
 
 确认当前仍是上一步的“大分区＋initramfs”，再执行：
 
 ```sh
-sysupgrade -T /tmp/large-sysupgrade.bin && sysupgrade -n /tmp/large-sysupgrade.bin
+sysupgrade -T /tmp/109M-KEXEC-sysupgrade.bin && sysupgrade -n /tmp/109M-KEXEC-sysupgrade.bin
 ```
 
 开始刷写后不要断电。此流程不需要另外执行 `mtd erase` 或 `ubiformat`，不使用 `-F` 强刷。
@@ -157,10 +157,11 @@ df -h /overlay
 
 ---
 已经测试成功。
-wrc-x3200gst3-openwrt-KERNEL-KEXEC 包含 原厂分区 过度image  initramfs.bin 和 sysupgrade.bin
-OpenWrt-WRC-X3200GST3-build 包含 109M 大分区 initramfs.bin 和 sysupgrade.bin
+wrc-x3200gst3-openwrt-KERNEL-KEXEC 包含 原厂分区 过度image  19M-KEXEC-initramfs.bin 和 19M-KEXEC-sysupgrade.bin
+OpenWrt-WRC-X3200GST3-build 包含 109M 大分区 109M-KEXEC-initramfs.bin 和 109M-KEXEC-sysupgrade.bin
 刷机步骤 
 1 刷入主线openwrt factory 固件
-2 在openwrt 里面 sysupgrade 升级 带kexec 程序的wrc-x3200gst3-openwrt-KERNEL-KEXEC sysupgrade.bin
-3 在新的kexec openwrt 里面 使用上面描述细节 启动 大分区  initramfs.bin
-4 在大分区 ramfs里面 openwrt 页面 刷写 大分区 sysupgrade.bin
+2 在openwrt 里面 sysupgrade 升级 带kexec 程序的wrc-x3200gst3-openwrt-KERNEL-KEXEC  19M-KEXEC-sysupgrade.bin
+3 在新的kexec openwrt 里面 使用上面描述细节 启动 大分区   109M-KEXEC-initramfs.bin 
+4 在大分区 ramfs里面 openwrt 页面 刷写 大分区  109M-KEXEC-sysupgrade.bin
+反过来 从大分区恢复小分区应该也能正常。但是没有测试。
